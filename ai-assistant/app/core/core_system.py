@@ -68,6 +68,9 @@ class CoreSystem:
     
     async def message_processing_loop(self):
         """Основной цикл обработки сообщений"""
+        # Обработать существующие сообщения при запуске
+        await self._process_existing_messages()
+        
         while self.running:
             try:
                 # Проверка запросов на переписку (для Instagram)
@@ -92,13 +95,45 @@ class CoreSystem:
                             thread_id=message.get("thread_id")
                         )
                 
-                # Пауза между проверками сообщений
-                await asyncio.sleep(60)  # Проверяем сообщения каждую минуту
+                # Пауза между проверками сообщений (уменьшаем до 10 секунд для более быстрой реакции)
+                await asyncio.sleep(10)  # Проверяем сообщения каждые 10 секунд
                 
             except Exception as e:
                 self.logger.error(f"Error in message processing loop: {e}")
                 # Пауза перед следующей попыткой в случае ошибки
-                await asyncio.sleep(300)  # 5 минут
+                await asyncio.sleep(60)  # 1 минута
+    
+    async def _process_existing_messages(self):
+        """Обработка существующих непрочитанных сообщений при старте бота"""
+        try:
+            self.logger.info("Processing existing unread messages")
+            # Проверка запросов на переписку (для Instagram)
+            if self.messenger_type == "instagram":
+                accepted_count = await self.messenger.accept_pending_requests()
+                if accepted_count > 0:
+                    self.logger.info(f"Accepted {accepted_count} pending message requests at startup")
+            
+            # Получаем непрочитанные сообщения
+            messages = await self.messenger.receive_messages()
+            
+            if messages:
+                self.logger.info(f"Found {len(messages)} existing unread messages")
+                
+                # Обрабатываем каждое сообщение
+                for message in messages:
+                    await self.process_message(
+                        platform=self.messenger_type,
+                        user_id=message["user_id"],
+                        message_text=message["text"],
+                        message_id=message["message_id"],
+                        thread_id=message.get("thread_id")
+                    )
+            else:
+                self.logger.info("No existing unread messages found")
+                
+        except Exception as e:
+            self.logger.error(f"Error processing existing messages: {e}")
+            # Продолжаем работу даже при ошибке обработки существующих сообщений
     
     async def process_message(self, platform, user_id, message_text, message_id, thread_id=None):
         """
@@ -112,6 +147,15 @@ class CoreSystem:
             thread_id: ID треда/чата (опционально)
         """
         try:
+            self.logger.info(f"Processing message from {user_id}: {message_text[:50]}...")
+            
+            # Маркируем сообщение как прочитанное (для Instagram)
+            if platform == "instagram" and thread_id:
+                self.logger.info(f"Marking thread {thread_id} as seen")
+                mark_result = await self.messenger.mark_seen(thread_id)
+                if not mark_result.get("success", False):
+                    self.logger.warning(f"Failed to mark thread as seen: {mark_result.get('error')}")
+
             # Получаем или создаем запись о клиенте
             client = await self._get_or_create_client(platform, user_id)
 
@@ -134,15 +178,19 @@ class CoreSystem:
             context = await self._get_client_context(client["id"])
 
             # Получаем ответ от ChatGPT
+            self.logger.info(f"Getting response from ChatGPT for user {user_id}")
             response = await self.chatgpt.get_response(user_id, message_text, context)
+            self.logger.info(f"ChatGPT generated response: {response[:50]}...")
 
             # Отправляем ответ клиенту
             if platform == "instagram":
                 # Проверяем, можно ли отправить сообщение с учетом лимитов
                 if await self.messenger.is_within_limits():
+                    self.logger.info(f"Sending response to {user_id}")
                     result = await self.messenger.send_message(user_id, response)
                     if result.get("success", False):
                         # Сохраняем исходящее сообщение
+                        self.logger.info(f"Message successfully sent to {user_id}")
                         await self._save_message(client["id"], "outgoing", response)
                     else:
                         self.logger.warning(f"Failed to send message to {user_id}: {result.get('error')}")
@@ -151,6 +199,8 @@ class CoreSystem:
 
         except Exception as e:
             self.logger.error(f"Error processing message: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
 
     async def _get_or_create_client(self, platform, platform_id):
         """
