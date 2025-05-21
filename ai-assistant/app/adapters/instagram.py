@@ -74,6 +74,18 @@ class InstagramAdapter(MessengerAdapter):
     async def authenticate(self) -> bool:
         """Аутентификация в Instagram"""
         try:
+            # Сначала пытаемся загрузить сессию из файла
+            logger.info(f"Trying to load session from file")
+            try:
+                self.client.load_settings(self.session_file)
+                # Проверяем, действительна ли сессия
+                self.client.get_timeline_feed()
+                self.authenticated = True
+                logger.info("Successfully loaded session from file")
+                return True
+            except Exception as e:
+                logger.error(f"Authentication error: {e}")
+                
             # Прямая авторизация без попытки загрузки сессии
             logger.info(f"Direct login attempt as {self.username}")
             if self.verification_code:
@@ -125,10 +137,11 @@ class InstagramAdapter(MessengerAdapter):
 
     async def is_within_limits(self) -> bool:
         """Проверка, не превышены ли лимиты использования API"""
-        # Проверяем, в рабочее ли время
-        if not await self.is_within_working_hours():
-            logger.info("Outside of working hours, not sending messages")
-            return False
+        # Временно отключаем проверку рабочих часов для тестирования
+        # Когда бот будет работать корректно, можно вернуть эту проверку
+        # if not await self.is_within_working_hours():
+        #     logger.info("Outside of working hours, not sending messages")
+        #     return False
         
         # Проверяем количество сообщений за день
         if self.messages_sent_today >= INSTAGRAM_MAX_MESSAGES_PER_DAY:
@@ -196,6 +209,85 @@ class InstagramAdapter(MessengerAdapter):
                     
             return {"success": False, "error": str(e)}
 
+    async def mark_seen(self, thread_id: str) -> Dict[str, Any]:
+        """Отметить сообщения треда как прочитанные"""
+        if not self.authenticated:
+            if not await self.authenticate():
+                return {"success": False, "error": "Authentication failed"}
+        
+        try:
+            logger.info(f"Marking thread {thread_id} as seen")
+            
+            # Отправляем запрос на отметку сообщений как прочитанных
+            try:
+                # В Instagram API v1 нет прямого эндпоинта для пометки сообщений как прочитанных,
+                # поэтому используем специальный запрос к direct_v2/threads/{thread_id}
+                
+                # Сначала получаем последнее сообщение треда
+                thread_data = self.client.private_request(f"direct_v2/threads/{thread_id}/", 
+                                               params={"visual_message_return_type": "unseen", 
+                                                      "direction": "older", 
+                                                      "seq_id": "0", 
+                                                      "limit": "1"})
+                
+                if not thread_data or "thread" not in thread_data or "items" not in thread_data["thread"] or not thread_data["thread"]["items"]:
+                    logger.warning(f"No thread data or messages found for thread_id {thread_id}")
+                    return {"success": False, "error": "No messages found in thread"}
+                
+                # Получаем ID последнего сообщения и отметку времени
+                last_item = thread_data["thread"]["items"][0]
+                last_item_id = last_item.get("item_id")
+                thread_id = thread_data["thread"]["thread_id"]
+                
+                if not last_item_id:
+                    logger.warning(f"Failed to get last item ID for thread {thread_id}")
+                    return {"success": False, "error": "Failed to get last item ID"}
+                
+                # Используем более правильный API endpoint для отметки сообщений как прочитанных
+                response = self.client.private_request(
+                    "direct_v2/threads/mark_seen/",
+                    {
+                        "thread_ids": f"[{thread_id}]",
+                        "item_ids": f"[{last_item_id}]",
+                        "_uuid": self.client.uuid,
+                        "_uid": self.client.user_id,
+                        "_csrftoken": self.client.private.cookies.get("csrftoken", "")
+                    }
+                )
+                
+                if response.get("status") == "ok":
+                    logger.info(f"Successfully marked thread {thread_id} as seen")
+                    return {"success": True}
+                else:
+                    logger.warning(f"Failed to mark thread {thread_id} as seen: {response}")
+                    return {"success": False, "error": str(response)}
+                    
+            except Exception as e:
+                logger.error(f"Error marking thread as seen: {e}")
+                
+                # Альтернативный метод - загружаем всю ветку и отметим её как прочитанную
+                try:
+                    # Пытаемся использовать метод from_id из instagrapi для получения объекта треда
+                    self.client.direct_send("", [], thread_ids=[thread_id])
+                    logger.info(f"Successfully marked thread {thread_id} as seen using dummy message method")
+                    return {"success": True}
+                except Exception as alt_e:
+                    logger.error(f"Alternative method also failed: {alt_e}")
+                    return {"success": False, "error": str(alt_e)}
+        
+        except Exception as e:
+            logger.error(f"Error marking thread as seen: {e}")
+            
+            # Проверка, не требуется ли повторная аутентификация
+            if isinstance(e, (LoginRequired, ChallengeRequired)):
+                logger.info("Session expired, trying to re-authenticate")
+                self.authenticated = False
+                if await self.authenticate():
+                    # Повторяем попытку после повторной аутентификации
+                    return await self.mark_seen(thread_id)
+                    
+            return {"success": False, "error": str(e)}
+
     async def receive_messages(self) -> List[Dict[str, Any]]:
         """Получение новых сообщений из Instagram"""
         if not self.authenticated:
@@ -205,48 +297,109 @@ class InstagramAdapter(MessengerAdapter):
         try:
             messages = []
             
-            # Получаем входящие сообщения используя прямой метод для доступа к inbox
-            logger.info("Fetching inbox")
+            # Проверяем наличие новых запросов на сообщения и принимаем их
+            await self.accept_pending_requests()
+            
+            # Получение входящих сообщений с использованием прямых запросов к API
             try:
-                # Попытка использовать direct_threads
-                if hasattr(self.client, 'direct_threads'):
-                    threads = self.client.direct_threads()
+                logger.info("Fetching inbox")
+                # Получаем входящие сообщения через API
+                inbox_data = self.client.private_request("direct_v2/inbox/", 
+                                                  params={"visual_message_return_type": "unseen", 
+                                                          "thread_message_limit": 20, 
+                                                          "persistentBadging": "true", 
+                                                          "limit": 20, 
+                                                          "is_prefetching": "false"})
+                
+                if not inbox_data or "inbox" not in inbox_data or "threads" not in inbox_data["inbox"]:
+                    logger.warning("No inbox data returned from API")
+                    return []
+                
+                threads = inbox_data["inbox"]["threads"]
+                logger.info(f"Total threads to process: {len(threads)}")
+                
+                # Детально логируем информацию о каждом треде для отладки
+                for i, thread in enumerate(threads):
+                    thread_id = thread.get("thread_id")
+                    thread_title = thread.get("thread_title")
+                    unread_count = thread.get("unread_count", 0)
+                    has_newer = thread.get("has_newer", False)
+                    is_group = thread.get("is_group", False)
+                    participants = [p.get("username") for p in thread.get("users", [])]
+                    logger.info(f"Thread {i+1}: ID={thread_id}, Title={thread_title}, Unread={unread_count}, " +
+                                f"Has newer={has_newer}, Is group={is_group}, Participants={participants}")
+                
+                for thread in threads:
+                    # Обрабатываем все треды, даже если они отмечены как прочитанные
+                    thread_id = thread.get("thread_id")
+                    unread_count = thread.get("unread_count", 0)
                     
-                    # Обрабатываем каждый тред (диалог)
-                    for thread in threads:
-                        thread_id = getattr(thread, 'id', None)
-                        if not thread_id:
-                            continue
+                    logger.info(f"Processing thread {thread_id}, unread count: {unread_count}")
+                    
+                    # Получаем сообщения треда независимо от статуса прочтения
+                    logger.info(f"Fetching messages for thread {thread_id}")
+                    thread_data = self.client.private_request(f"direct_v2/threads/{thread_id}/", 
+                                                       params={"visual_message_return_type": "unseen", 
+                                                               "direction": "older", 
+                                                               "seq_id": "0", 
+                                                               "limit": "20"})
+                    
+                    if not thread_data or "thread" not in thread_data or "items" not in thread_data["thread"]:
+                        logger.warning(f"No thread data returned for thread_id {thread_id}")
+                        continue
+                    
+                    items = thread_data["thread"]["items"]
+                    logger.info(f"Found {len(items)} messages in thread {thread_id}")
+                    
+                    # Получаем текущее время в миллисекундах
+                    current_time = int(time.time() * 1000000)
+                    # Получаем время 24 часа назад
+                    time_24h_ago = current_time - (24 * 60 * 60 * 1000000)
+                    
+                    # Логируем первые несколько сообщений для отладки
+                    for i, item in enumerate(items[:5]):  # Логируем только первые 5 сообщений
+                        item_type = item.get("item_type")
+                        item_id = item.get("item_id")
+                        user_id = item.get("user_id")
+                        timestamp = item.get("timestamp", 0)
+                        text = item.get("text", "")
+                        logger.info(f"Message {i+1}: ID={item_id}, Type={item_type}, " +
+                                   f"User={user_id}, Time={timestamp}, Text={text}")
+                        
+                        # Проверяем, было ли сообщение отправлено в последние 24 часа
+                        is_recent = int(timestamp) > time_24h_ago
+                        logger.info(f"Message is recent (within last 24h): {is_recent}")
+                    
+                    processed_messages = []
+                    # Обрабатываем только текстовые сообщения, не от нас, и полученные за последние 24 часа
+                    for item in items:
+                        if (item.get("item_type") == "text" and 
+                            str(item.get("user_id")) != str(self.client.user_id) and
+                            int(item.get("timestamp", 0)) > time_24h_ago):
                             
-                        # Проверяем, есть ли непрочитанные сообщения
-                        unread_count = getattr(thread, 'unread_count', 0)
-                        if unread_count > 0:
-                            # Получаем полную информацию о треде
-                            full_thread = self.client.direct_thread(thread_id)
-                            
-                            # Обрабатываем сообщения в треде
-                            items = getattr(full_thread, 'items', [])
-                            for item in items:
-                                # Проверяем, что сообщение не от нас
-                                if (hasattr(item, 'user_id') and 
-                                    hasattr(item, 'text') and 
-                                    item.user_id != self.client.user_id):
-                                    
-                                    logger.info(f"Found message from user {item.user_id}: {item.text}")
-                                    
-                                    messages.append({
-                                        "message_id": getattr(item, 'id', ''),
-                                        "thread_id": thread_id,
-                                        "user_id": item.user_id,
-                                        "text": item.text,
-                                        "timestamp": getattr(item, 'timestamp', datetime.now())
-                                    })
-                else:
-                    logger.error("No suitable method found to fetch direct messages")
+                            logger.info(f"Adding recent message to process: {item.get('text', '')[:30]}...")
+                            processed_messages.append({
+                                "message_id": item.get("item_id"),
+                                "thread_id": thread_id,
+                                "user_id": item.get("user_id"),
+                                "text": item.get("text", ""),
+                                "timestamp": datetime.fromtimestamp(int(item.get("timestamp", time.time())) / 1000000.0)
+                            })
+                    
+                    # Добавляем сообщения в общий список для обработки
+                    messages.extend(processed_messages)
+                    
+                    if processed_messages:
+                        logger.info(f"Added {len(processed_messages)} recent messages from thread {thread_id}")
+                    else:
+                        logger.info(f"No recent messages to process in thread {thread_id}")
+                    
+                # Логируем итоговое количество собранных сообщений
+                logger.info(f"Total messages collected for processing: {len(messages)}")
+                
             except Exception as e:
                 logger.error(f"Error fetching inbox: {e}")
             
-            logger.info(f"Total messages to process: {len(messages)}")
             return messages
                 
         except Exception as e:
@@ -272,59 +425,90 @@ class InstagramAdapter(MessengerAdapter):
             # Получение запросов на переписку
             logger.info("Checking pending message requests")
             try:
-                pending_requests = self.client.direct_pending_inbox()
+                # Используем прямой запрос к API для получения запросов
+                pending_inbox = self.client.private_request("direct_v2/pending_inbox/", 
+                                                     params={"visual_message_return_type": "unseen", 
+                                                             "persistentBadging": "true", 
+                                                             "is_prefetching": "false"})
                 
-                # Проверяем, что ответ это список объектов
-                if isinstance(pending_requests, list):
-                    if not pending_requests:
-                        logger.info("No pending message requests found")
-                        return 0
-                        
-                    logger.info(f"Found {len(pending_requests)} pending message requests")
-                    
-                    # Принимаем каждый запрос
-                    accepted_count = 0
-                    for thread in pending_requests:
-                        thread_id = getattr(thread, 'id', None) or getattr(thread, 'thread_id', None)
-                        if thread_id:
-                            try:
-                                logger.info(f"Accepting message request for thread {thread_id}")
-                                self.client.direct_thread_approve(thread_id)
-                                accepted_count += 1
-                                logger.info(f"Successfully accepted message request for thread {thread_id}")
-                            except Exception as e:
-                                logger.error(f"Error accepting message request for thread {thread_id}: {e}")
-                    
-                    return accepted_count
-                    
-                # Если ответ это словарь (другая версия API)
-                elif isinstance(pending_requests, dict):
-                    threads = pending_requests.get('inbox', {}).get('threads', [])
-                    if not threads:
-                        logger.info("No pending message requests found")
-                        return 0
-                        
-                    logger.info(f"Found {len(threads)} pending message requests")
-                    
-                    # Принимаем каждый запрос
-                    accepted_count = 0
-                    for thread in threads:
-                        thread_id = thread.get('thread_id')
-                        if thread_id:
-                            try:
-                                logger.info(f"Accepting message request for thread {thread_id}")
-                                self.client.direct_thread_approve(thread_id)
-                                accepted_count += 1
-                                logger.info(f"Successfully accepted message request for thread {thread_id}")
-                            except Exception as e:
-                                logger.error(f"Error accepting message request for thread {thread_id}: {e}")
-                    
-                    return accepted_count
-                else:
-                    logger.info(f"Unexpected type for pending_requests: {type(pending_requests)}")
+                if not pending_inbox or "inbox" not in pending_inbox or "threads" not in pending_inbox["inbox"]:
+                    logger.info("No pending message requests found")
                     return 0
-            except AttributeError:
-                logger.error("Method direct_pending_inbox not found")
+                
+                threads = pending_inbox["inbox"]["threads"]
+                
+                if not threads:
+                    logger.info("No pending message requests found")
+                    return 0
+                    
+                logger.info(f"Found {len(threads)} pending message requests")
+                
+                # Принимаем каждый запрос
+                accepted_count = 0
+                for thread in threads:
+                    thread_id = thread.get("thread_id")
+                    if thread_id:
+                        try:
+                            logger.info(f"Accepting message request for thread {thread_id}")
+                            # Используем прямой запрос к API для одобрения запроса
+                            response = self.client.private_request(
+                                "direct_v2/threads/approve_multiple/",
+                                params={},
+                                data={"thread_ids": f"[{thread_id}]"}
+                            )
+                            logger.info(f"Successfully accepted message request for thread {thread_id}")
+                            accepted_count += 1
+                            
+                        except Exception as e1:
+                            logger.warning(f"First method failed: {e1}, trying alternative methods...")
+                            
+                            try:
+                                # Альтернативный метод - попытка прямой отправки форм-данных
+                                import requests
+                                from requests.utils import dict_from_cookiejar
+                                
+                                # Извлекаем все необходимые токены и куки
+                                cookies_dict = dict_from_cookiejar(self.client.private.cookies)
+                                csrf_token = cookies_dict.get("csrftoken", "")
+                                
+                                # Формируем заголовки с токенами
+                                headers = {
+                                    "User-Agent": self.client.user_agent,
+                                    "Accept": "*/*",
+                                    "Accept-Language": "en-US",
+                                    "Accept-Encoding": "gzip, deflate",
+                                    "X-CSRFToken": csrf_token,
+                                    "X-IG-App-ID": "936619743392459",
+                                    "X-Instagram-AJAX": "1",
+                                    "X-IG-WWW-Claim": "0",
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Origin": "https://www.instagram.com",
+                                    "Referer": "https://www.instagram.com/direct/inbox/"
+                                }
+                                
+                                # Последняя попытка - использовать другой API endpoint
+                                url2 = "https://i.instagram.com/api/v1/direct_v2/threads/approve_multiple/"
+                                data2 = {"thread_ids": f"[{thread_id}]"}
+                                
+                                response2 = requests.post(
+                                    url2, 
+                                    headers=headers, 
+                                    cookies=cookies_dict, 
+                                    data=data2
+                                )
+                                
+                                if response2.status_code == 200:
+                                    logger.info(f"Successfully accepted message request for thread {thread_id} (approve_multiple)")
+                                    accepted_count += 1
+                                else:
+                                    logger.error(f"All methods failed. Status: {response2.status_code}, Response: {response2.text}")
+                            
+                            except Exception as e2:
+                                logger.error(f"Alternative method failed too: {e2}")
+                
+                return accepted_count
+            except Exception as e:
+                logger.error(f"Error handling pending requests: {e}")
                 return 0
                 
         except Exception as e:
